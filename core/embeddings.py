@@ -1,320 +1,286 @@
 """
-Embedding model management for the MIND system.
+Embedding models and operations for the Agentic RAG Medical Documentation System.
 
-This module handles HuggingFace embedding model loading with robust error
-handling, automatic GPU/CPU device selection, and singleton pattern to prevent
-loading the same model multiple times.
+UPDATED: Now supports both TEI servers (GPU-accelerated) and local model loading.
+Automatically selects based on INFERENCE_MODE configuration.
 
-Architecture:
-    The embedding model is loaded once and cached for reuse. The module
-    automatically determines the optimal device (GPU or CPU) based on
-    availability and memory constraints.
+When using TEI mode:
+- Embeddings are computed via HTTP API to TEI server
+- No model loading in this process
+- GPU memory stays available for vLLM
 
-    Device Selection Strategy:
-        1. Check preferred device (from config)
-        2. If GPU: verify CUDA available and check memory
-        3. If insufficient GPU memory: fallback to CPU
-        4. Try multiple loading strategies with fallback
-
-Key Functions:
-    get_embedding_model: Main function to get cached or load embedding model
-
-Dependencies:
-    - langchain_huggingface: HuggingFace embeddings interface
-    - core.device_manager: GPU/CPU device selection and memory management
-    - config.settings: Model configuration
-
-Singleton Pattern:
-    The module uses global caching to ensure the embedding model is only
-    loaded once. Subsequent calls to get_embedding_model() return the
-    cached instance.
-
-Example:
-    >>> from core.embeddings import get_embedding_model
-    >>> embeddings = get_embedding_model()
-    >>> vector = embeddings.embed_query("medical text")
-    >>> print(f"Embedding dimension: {len(vector)}")
+When using local mode:
+- Models are loaded into this process
+- Uses configured device (CPU/GPU)
 """
 
-import logging
-from typing import List, Dict, Any, Optional
+import os
+from typing import List, Union
 
-from langchain_huggingface import HuggingFaceEmbeddings
-import torch
-
-from .device_manager import get_optimal_device, cleanup_cuda_cache
-from .exceptions import ModelLoadingError
-from .types import DeviceType
-from config.settings import EMBEDDING_MODEL_NAME, EMBEDDING_DEVICE
-
-# Configure logger for this module
-logger = logging.getLogger(__name__)
+# Import configuration
+from config.settings import (
+    EMBEDDING_MODEL_NAME, 
+    EMBEDDING_DEVICE,
+    ACTUAL_INFERENCE_MODE,
+    TEI_EMBEDDING_URL
+)
 
 # Global cache for embedding model (singleton pattern)
-_cached_embedding_model: Optional[HuggingFaceEmbeddings] = None
-_cached_embedding_device: Optional[str] = None
-
-# Minimum free GPU memory required for embedding model (in GB)
-# 0.6B parameter model ≈ 1.2GB + buffer
-MIN_EMBEDDING_MEMORY_GB = 1.5
+_embedding_model_cache = None
+_embedding_device_cache = None
 
 
-def _verify_model_functionality(
-    embeddings: HuggingFaceEmbeddings,
-    device: str
-) -> bool:
+class TEIEmbeddingWrapper:
     """
-    Verify the embedding model works correctly with a test embedding.
-
-    Args:
-        embeddings: The embedding model to test
-        device: Device the model is loaded on
-
-    Returns:
-        True if model works correctly, False otherwise
-
-    Raises:
-        ModelLoadingError: If model fails even on CPU (critical failure)
+    Wrapper that provides HuggingFaceEmbeddings-compatible interface
+    using TEI server backend.
     """
-    logger.debug("Verifying embedding model functionality")
-
-    try:
-        test_text = "Test embedding"
-        test_vector = embeddings.embed_query(test_text)
-        logger.info(f"Test embedding successful (dimension: {len(test_vector)})")
-        return True
-
-    except Exception as test_error:
-        error_msg = str(test_error).lower()
-        logger.warning(f"Test embedding failed on {device}: {str(test_error)}")
-
-        # Check if it's a CUDA/GPU error during usage
-        if any(keyword in error_msg for keyword in ['cuda', 'nvml', 'gpu', 'device', 'caching']):
-            logger.warning("GPU error detected during model usage - model may be in inconsistent state")
-
-            # Clean up CUDA cache
-            if device.startswith("cuda"):
-                logger.info("Clearing CUDA cache after GPU error")
-                cleanup_cuda_cache()
-
-            # If not on CPU, we can try CPU fallback
-            if device != "cpu":
-                logger.info("Will try CPU fallback")
-                return False
+    
+    def __init__(self, base_url: str = None):
+        """
+        Initialize TEI embedding wrapper.
+        
+        Args:
+            base_url: TEI server URL (default from config)
+        """
+        import requests
+        
+        self.base_url = (base_url or TEI_EMBEDDING_URL).rstrip('/')
+        self._dimension = None
+        self._requests = requests
+        
+        # Verify connection
+        self._verify_connection()
+    
+    def _verify_connection(self):
+        """Verify TEI server is accessible."""
+        try:
+            response = self._requests.get(f"{self.base_url}/info", timeout=5)
+            if response.status_code == 200:
+                info = response.json()
+                print(f"[TEI Embeddings] Connected to: {self.base_url}")
+                print(f"[TEI Embeddings] Model: {info.get('model_id', 'unknown')}")
             else:
-                # Model failed even on CPU - this is critical
-                raise ModelLoadingError(
-                    f"Model failed even on CPU: {str(test_error)}",
-                    model_name=EMBEDDING_MODEL_NAME,
-                    device="cpu"
-                )
-        else:
-            # Non-GPU error during test - re-raise
-            raise ModelLoadingError(
-                f"Model verification failed: {str(test_error)}",
-                model_name=EMBEDDING_MODEL_NAME,
-                device=device
-            )
-
-
-def _attempt_model_load(
-    device: str,
-    attempt_number: int,
-    total_attempts: int
-) -> Optional[HuggingFaceEmbeddings]:
-    """
-    Attempt to load the embedding model with a specific strategy.
-
-    Tries different loading strategies in order:
-    1. Use system default cache (most reliable)
-    2. Force re-download if cached version is corrupted
-    3. Try with trust_remote_code for some models
-
-    Args:
-        device: Device to load model on
-        attempt_number: Current attempt number (1-indexed)
-        total_attempts: Total number of attempts to try
-
-    Returns:
-        HuggingFaceEmbeddings instance if successful, None otherwise
-    """
-    loading_strategies = [
-        # 1. Use system default cache (most reliable)
-        {"model_kwargs": {'device': device}},
-
-        # 2. Force re-download if cached version is corrupted
-        {"model_kwargs": {'device': device}, 'cache_folder': None},
-
-        # 3. Try with trust_remote_code for some models
-        {"model_kwargs": {'device': device, 'trust_remote_code': True}},
-    ]
-
-    if attempt_number > len(loading_strategies):
-        return None
-
-    kwargs = loading_strategies[attempt_number - 1]
-
-    logger.info(
-        f"Attempting to load embedding model on {device} "
-        f"(strategy {attempt_number}/{total_attempts})"
-    )
-
-    try:
-        embeddings = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL_NAME,
-            **kwargs
+                print(f"[TEI WARNING] Server returned status {response.status_code}")
+        except Exception as e:
+            print(f"[TEI WARNING] Connection check failed: {e}")
+    
+    def embed_query(self, text: str) -> List[float]:
+        """
+        Embed a single query text.
+        
+        Args:
+            text: Query text to embed
+            
+        Returns:
+            List of floats representing the embedding
+        """
+        response = self._requests.post(
+            f"{self.base_url}/embed",
+            json={"inputs": [text]},
+            timeout=60
         )
-
-        # Verify device placement
-        if hasattr(embeddings, 'client') and hasattr(embeddings.client, 'device'):
-            actual_device = str(embeddings.client.device)
-            logger.debug(f"Model device verified: {actual_device}")
-
-        return embeddings
-
-    except Exception as e:
-        error_msg = str(e).lower()
-        logger.warning(f"Loading strategy {attempt_number} on {device} failed: {str(e)}")
-
-        # Check if it's a GPU-related error
-        if any(keyword in error_msg for keyword in ['cuda', 'gpu', 'memory', 'device', 'nvml', 'caching']):
-            logger.info("GPU-related error detected during loading")
-
-            # Clean up CUDA cache before giving up on this device
-            if device.startswith("cuda"):
-                logger.info("Clearing CUDA cache")
-                cleanup_cuda_cache()
-
-        return None
-
-
-def _load_on_device(device: str) -> Optional[HuggingFaceEmbeddings]:
-    """
-    Load embedding model on a specific device with multiple strategies.
-
-    Tries multiple loading strategies and verifies the model works before
-    returning it.
-
-    Args:
-        device: Device to load model on ("cpu", "cuda", "cuda:0", etc.)
-
-    Returns:
-        HuggingFaceEmbeddings instance if successful, None if all strategies fail
-    """
-    logger.info(f"Attempting to load embedding model on {device}")
-
-    total_attempts = 3
-
-    for attempt in range(1, total_attempts + 1):
-        embeddings = _attempt_model_load(device, attempt, total_attempts)
-
-        if embeddings is not None:
-            # Verify model works before declaring success
-            if _verify_model_functionality(embeddings, device):
-                logger.info(f"Embedding model loaded and verified successfully on {device}")
-                return embeddings
-            else:
-                # Verification failed, try next strategy or device
-                logger.warning(f"Model verification failed for strategy {attempt}")
-                continue
-
-    # All strategies failed for this device
-    logger.warning(f"All loading strategies failed on {device}")
-    return None
+        response.raise_for_status()
+        result = response.json()
+        
+        # Cache dimension
+        if self._dimension is None:
+            self._dimension = len(result[0])
+            print(f"[TEI Embeddings] Dimension: {self._dimension}")
+        
+        return result[0]
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """
+        Embed multiple documents.
+        
+        Args:
+            texts: List of documents to embed
+            
+        Returns:
+            List of embeddings
+        """
+        if not texts:
+            return []
+        
+        response = self._requests.post(
+            f"{self.base_url}/embed",
+            json={"inputs": texts},
+            timeout=120
+        )
+        response.raise_for_status()
+        return response.json()
+    
+    async def aembed_query(self, text: str) -> List[float]:
+        """Async version (falls back to sync)."""
+        return self.embed_query(text)
+    
+    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Async version (falls back to sync)."""
+        return self.embed_documents(texts)
 
 
-def get_embedding_model() -> HuggingFaceEmbeddings:
+def get_embeddings():
     """
     Get the configured embedding model with robust error handling.
-
-    This function automatically handles GPU/CPU device selection with fallback,
-    uses singleton pattern to cache the model, and implements multiple loading
-    strategies for robustness.
-
-    Device Selection:
-        1. Uses device specified in config (EMBEDDING_DEVICE)
-        2. Checks GPU memory availability before attempting GPU load
-        3. Automatically falls back to CPU if GPU unavailable or insufficient memory
-        4. Tries multiple loading strategies per device
-
-    Singleton Pattern:
-        Model is loaded once and cached. Subsequent calls return the cached
-        instance immediately without reloading.
-
+    
+    Automatically selects between TEI server and local model based on
+    INFERENCE_MODE configuration.
+    
+    Uses singleton pattern - only initializes once.
+    
     Returns:
-        HuggingFaceEmbeddings: Configured and verified embedding model instance
-
-    Raises:
-        ModelLoadingError: If model fails to load on all devices and strategies
-
-    Example:
-        >>> embeddings = get_embedding_model()
-        >>> vector = embeddings.embed_query("diabetes mellitus")
-        >>> print(f"Vector dimension: {len(vector)}")
+        Embedding model instance (TEI wrapper or HuggingFaceEmbeddings)
     """
-    global _cached_embedding_model, _cached_embedding_device
+    global _embedding_model_cache, _embedding_device_cache
 
-    # Return cached model if already loaded (singleton pattern)
-    if _cached_embedding_model is not None:
-        logger.info(
-            f"Reusing cached embedding model (device: {_cached_embedding_device})"
-        )
-        return _cached_embedding_model
+    # Return cached model if already loaded
+    if _embedding_model_cache is not None:
+        return _embedding_model_cache
 
-    logger.info("=" * 60)
-    logger.info("Loading Embedding Model")
-    logger.info("=" * 60)
-    logger.info(f"Model: {EMBEDDING_MODEL_NAME}")
-    logger.info(f"Target device: {EMBEDDING_DEVICE}")
-
-    # Determine optimal device (handles GPU memory checking and fallback)
-    try:
-        optimal_device = get_optimal_device(
-            preferred_device=EMBEDDING_DEVICE,
-            min_memory_gb=MIN_EMBEDDING_MEMORY_GB,
-            model_name="embedding",
-            allow_cpu_fallback=True
-        )
-        logger.info(f"Selected device: {optimal_device}")
-    except Exception as e:
-        logger.error(f"Failed to determine optimal device: {e}")
-        # Default to CPU if device selection fails
-        optimal_device = "cpu"
-        logger.info("Defaulting to CPU due to device selection error")
-
-    # Try to load on the optimal device
-    embeddings = _load_on_device(optimal_device)
-
-    if embeddings is not None:
-        # Success! Cache and return
-        _cached_embedding_model = embeddings
-        _cached_embedding_device = optimal_device
-        logger.info("Embedding model cached for reuse")
-        logger.info("=" * 60)
+    # Use TEI mode
+    if ACTUAL_INFERENCE_MODE == "tei":
+        print(f"[INFO] Using TEI embedding server at {TEI_EMBEDDING_URL}")
+        
+        embeddings = TEIEmbeddingWrapper(TEI_EMBEDDING_URL)
+        
+        # Test the connection
+        try:
+            test_embedding = embeddings.embed_query("test")
+            print(f"[SUCCESS] TEI embeddings ready (dimension: {len(test_embedding)})")
+        except Exception as e:
+            print(f"[ERROR] TEI embedding test failed: {e}")
+            print(f"[INFO] Make sure TEI server is running on {TEI_EMBEDDING_URL}")
+            raise
+        
+        _embedding_model_cache = embeddings
+        _embedding_device_cache = "tei"
         return embeddings
+    
+    # Use local mode (original implementation)
+    return _get_local_embeddings()
 
-    # If optimal device failed and it wasn't CPU, try CPU as last resort
-    if optimal_device != "cpu":
-        logger.warning(f"Failed to load on {optimal_device}, trying CPU as last resort")
-        embeddings = _load_on_device("cpu")
 
-        if embeddings is not None:
-            _cached_embedding_model = embeddings
-            _cached_embedding_device = "cpu"
-            logger.info("Embedding model cached for reuse")
-            logger.info("=" * 60)
+def _get_local_embeddings():
+    """
+    Load embeddings locally (original implementation).
+    
+    Used when INFERENCE_MODE="local".
+    """
+    global _embedding_model_cache, _embedding_device_cache
+    
+    from langchain_huggingface import HuggingFaceEmbeddings
+    import torch
+    
+    print(f"[INFO] Loading local embedding model: {EMBEDDING_MODEL_NAME}")
+    print(f"[INFO] Target device: {EMBEDDING_DEVICE}")
+
+    device_attempts = []
+    if EMBEDDING_DEVICE == "cuda" or EMBEDDING_DEVICE.startswith("cuda:"):
+        if torch.cuda.is_available():
+            device_attempts = [EMBEDDING_DEVICE, "cpu"]
+        else:
+            print(f"[WARNING] CUDA requested but not available, using CPU")
+            device_attempts = ["cpu"]
+    else:
+        device_attempts = [EMBEDDING_DEVICE]
+
+    for device in device_attempts:
+        # Check GPU memory before loading
+        if device.startswith("cuda"):
+            gpu_idx = 0 if device == "cuda" else int(device.split(":")[1])
+            free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(gpu_idx)
+            free_mem = free_mem_bytes / (1024**3)
+            
+            print(f"[EMBEDDING GPU] Free: {free_mem:.2f}GB")
+            
+            MIN_FREE_FOR_EMBEDDING = 2.23
+            if free_mem < MIN_FREE_FOR_EMBEDDING:
+                print(f"[EMBEDDING GPU] Insufficient memory, falling back to CPU")
+                continue
+
+        try:
+            print(f"[INFO] Attempting to load on {device}...")
+            
+            embeddings = HuggingFaceEmbeddings(
+                model_name=EMBEDDING_MODEL_NAME,
+                model_kwargs={'device': device}
+            )
+            
+            # Verify with test embedding
+            test_vector = embeddings.embed_query("Test embedding")
+            print(f"[SUCCESS] Embeddings loaded on {device} (dim: {len(test_vector)})")
+            
+            _embedding_model_cache = embeddings
+            _embedding_device_cache = device
             return embeddings
 
-    # All devices and strategies failed
-    logger.error("All embedding loading methods failed on all devices")
-    logger.error("This usually indicates:")
-    logger.error("  1. No internet connection for initial model download")
-    logger.error("  2. Corrupted model cache")
-    logger.error("  3. HuggingFace Hub connectivity issues")
-    logger.error("  4. Insufficient GPU/CPU memory")
-    logger.error("=" * 60)
+        except torch.cuda.OutOfMemoryError:
+            print(f"[WARNING] GPU OOM on {device}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if device != "cpu":
+                continue
+            raise
 
-    raise ModelLoadingError(
-        "Failed to load embedding model after trying all strategies and devices",
-        model_name=EMBEDDING_MODEL_NAME
-    )
+        except Exception as e:
+            print(f"[WARNING] Failed on {device}: {e}")
+            if device != device_attempts[-1]:
+                continue
+            raise
+
+    raise Exception("Failed to load embeddings on any device")
+
+def reset_embedding_cache():
+    """Force reload of embedding model (call after changing models)."""
+    global _embedding_model_cache, _embedding_device_cache
+    _embedding_model_cache = None
+    _embedding_device_cache = None
+    print("[INFO] Embedding cache cleared")
+
+# Sentence-transformers compatible interface for hybrid_search
+class SentenceTransformerWrapper:
+    """
+    Wrapper that provides sentence-transformers compatible encode() method
+    for both TEI and local embeddings.
+    """
+    
+    def __init__(self, embeddings=None):
+        """
+        Initialize wrapper.
+        
+        Args:
+            embeddings: Embedding model (auto-detected if None)
+        """
+        self._embeddings = embeddings or get_embeddings()
+    
+    def encode(self, texts: Union[str, List[str]], **kwargs):
+        """
+        Encode texts into embeddings.
+        
+        Compatible with sentence-transformers encode() interface.
+        
+        Args:
+            texts: Single text or list of texts
+            **kwargs: Ignored (for compatibility)
+            
+        Returns:
+            numpy array of embeddings
+        """
+        import numpy as np
+        
+        if isinstance(texts, str):
+            texts = [texts]
+        
+        embeddings = self._embeddings.embed_documents(texts)
+        return np.array(embeddings)
+
+
+def get_embedding_encoder():
+    """
+    Get a sentence-transformers compatible encoder.
+    
+    Returns:
+        SentenceTransformerWrapper instance
+    """
+    return SentenceTransformerWrapper()
